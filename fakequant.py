@@ -27,6 +27,7 @@ class CodebookQuantizer:
 
         self.nibble_to_fp4 = self._build_nibble_to_fp4_table()
         self.codebook = self._build_codebook()
+        self._error_table, self._value_table = self._build_lookup_tables()
 
     def _build_nibble_to_fp4_table(self):
         nibbles = torch.arange(16, dtype=torch.int64)
@@ -49,6 +50,16 @@ class CodebookQuantizer:
                 f"Unexpected codebook shape {tuple(codebook.shape)}; expected {expected_shape}."
             )
         return codebook
+
+    def _build_lookup_tables(self):
+        fp4 = self.fp4_representable
+        cb = self.codebook
+        sq_errors = (fp4[:, None, None] - cb[None, :, :]) ** 2
+        nearest_k = sq_errors.argmin(dim=-1)
+        error_table = sq_errors.gather(-1, nearest_k.unsqueeze(-1)).squeeze(-1)
+        c_range = torch.arange(cb.shape[0]).unsqueeze(0).expand(fp4.shape[0], -1)
+        value_table = cb[c_range, nearest_k]
+        return error_table, value_table
 
     def unpack_uint8_to_fp4(self, packed):
         if packed.dtype != torch.uint8:
@@ -124,7 +135,7 @@ class CodebookQuantizer:
         quantized_fp4 = quantized_blocks.reshape_as(fp4_values)
         return self.pack_fp4_to_uint8(quantized_fp4)
 
-    def fakequant_blocks(self, fp4_values):
+    def fakequant_blocks(self, fp4_values, return_mse: bool = False):
         if fp4_values.dim() != 2 or fp4_values.shape[1] != 16:
             raise ValueError(
                 f"fp4_values must have shape [num_blocks, 16], got {tuple(fp4_values.shape)}"
@@ -133,7 +144,10 @@ class CodebookQuantizer:
         source = fp4_values.to(dtype=torch.float32)
         num_blocks, block_size = source.shape
         if num_blocks == 0:
-            return source.clone()
+            empty = source.clone()
+            if return_mse:
+                return empty, torch.empty((0, self.codebook.shape[0]), dtype=torch.float32)
+            return empty
 
         full_tensor_bytes = num_blocks * self.codebook.shape[0] * block_size * 4
         max_blocks_per_chunk = max(
@@ -141,37 +155,38 @@ class CodebookQuantizer:
             self.MAX_CODEBOOK_TENSOR_BYTES // (self.codebook.shape[0] * block_size * 4),
         )
 
-        codebook = self.codebook.to(device=source.device, dtype=torch.float32)
-        if full_tensor_bytes <= self.MAX_CODEBOOK_TENSOR_BYTES:
-            return self._fakequant_blocks_chunk(source, codebook)
+        fp4 = self.fp4_representable.to(device=source.device)
+        error_table = self._error_table.to(device=source.device)
+        value_table = self._value_table.to(device=source.device)
 
-        quantized_chunks = []
-        for start in range(0, num_blocks, max_blocks_per_chunk):
-            end = min(start + max_blocks_per_chunk, num_blocks)
-            quantized_chunks.append(self._fakequant_blocks_chunk(source[start:end], codebook))
-        return torch.cat(quantized_chunks, dim=0)
+        if full_tensor_bytes <= self.MAX_CODEBOOK_TENSOR_BYTES:
+            result = self._fakequant_blocks_chunk(source, fp4, error_table, value_table)
+        else:
+            q_chunks = []
+            mse_chunks = []
+            for start in range(0, num_blocks, max_blocks_per_chunk):
+                end = min(start + max_blocks_per_chunk, num_blocks)
+                quantized, mse = self._fakequant_blocks_chunk(
+                    source[start:end], fp4, error_table, value_table
+                )
+                q_chunks.append(quantized)
+                mse_chunks.append(mse)
+            result = (torch.cat(q_chunks, dim=0), torch.cat(mse_chunks, dim=0))
+
+        if return_mse:
+            return result
+        if isinstance(result, tuple):
+            return result[0]
+        return result
 
     @staticmethod
-    def _fakequant_blocks_chunk(source, codebook):
-        num_blocks = source.shape[0]
-        best_mse = torch.full((num_blocks,), float("inf"), dtype=torch.float32, device=source.device)
-        best_quantized = torch.empty_like(source, dtype=torch.float32)
-        source_expanded = source.unsqueeze(-1)
-
-        for codebook_idx in range(codebook.shape[0]):
-            entry = codebook[codebook_idx]
-            sq_error = (source_expanded - entry.view(1, 1, 4)) ** 2
-            nearest_idx = sq_error.argmin(dim=-1)
-            nearest_sq_error = sq_error.gather(dim=-1, index=nearest_idx.unsqueeze(-1)).squeeze(-1)
-            mse = nearest_sq_error.mean(dim=1)
-
-            better = mse < best_mse
-            if better.any():
-                best_mse = torch.where(better, mse, best_mse)
-                quantized = entry[nearest_idx]
-                best_quantized[better] = quantized[better]
-
-        return best_quantized
+    def _fakequant_blocks_chunk(source, fp4, error_table, value_table):
+        element_indices = (source.unsqueeze(-1) == fp4).int().argmax(dim=-1)
+        element_errors = error_table[element_indices]
+        mse_all = element_errors.mean(dim=1)
+        best_c = mse_all.argmin(dim=-1)
+        best_c_expanded = best_c.unsqueeze(1).expand(-1, 16)
+        return value_table[element_indices, best_c_expanded], mse_all
 
 
 if __name__ == "__main__":

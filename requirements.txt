@@ -5,3 +5,4 @@ safetensors
 huggingface_hub
 accelerate
 lm-eval
+tensorrt_llm
