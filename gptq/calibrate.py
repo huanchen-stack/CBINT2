@@ -54,15 +54,15 @@ def collect_hessians(
 
     def make_hook(layer_name: str):
         def hook_fn(module, inp, out):
-            X = inp[0]
+            X = inp[0].detach()
             if X.dim() == 3:
                 X = X.reshape(-1, X.shape[-1])
-            X = X.float()
+            X = X.float().cpu()
             n = X.shape[0]
             d = X.shape[1]
 
             if layer_name not in hessians:
-                hessians[layer_name] = torch.zeros(d, d, device=X.device, dtype=torch.float32)
+                hessians[layer_name] = torch.zeros(d, d, dtype=torch.float32)
                 sample_counts[layer_name] = 0
 
             H = hessians[layer_name]
