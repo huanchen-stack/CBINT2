@@ -385,6 +385,8 @@ QuIP\#~\cite{tseng2024quipsharp}, AQLM~\cite{egiazarian2024aqlm}, QTIP~\cite{tse
 
 \textbf{NVFP4.}
 Four Over Six~\cite{cook2025fouroversix} and RaZeR~\cite{chen2026razer} improve NVFP4 accuracy but do not compress below 4.5 bits.
+Notably, RaZeR observes that ``lookup-based formats such as Normal-Float and Student-Float store the lookup table in FP16, necessitating high-precision MAC operations with significant energy overhead,'' concluding that ``the FP4-E2M1 format offers a favorable trade-off between model accuracy and hardware efficiency''~\cite{chen2026razer}.
+CBINT2 delivers exactly this trade-off at sub-4-bit rates: our codebook entries \emph{are} FP4-E2M1 values, so dequantization feeds tensor cores directly with no FP16 intermediate.
 
 \textbf{Kernels.}
 QServe~\cite{lin2025qserve} quantifies 20--90\% dequant overhead; MARLIN~\cite{frantar2024marlin} optimizes W4A16; CodeGEMM~\cite{park2025codegemm} eliminates VQ dequant via precomputed partial sums.

@@ -116,3 +116,187 @@
   howpublished={\url{https://huggingface.co/Qwen/Qwen3-30B-A3B}},
   year={2025}
 }
+
+% ===== NEW REFERENCES FROM LITERATURE SURVEY (2026-03-31) =====
+
+% --- NVFP4-Specific Papers ---
+
+@inproceedings{egiazarian2026mrgptq,
+  title={Bridging the Gap Between Promise and Performance for Microscaling {FP4} Quantization},
+  author={Egiazarian, Vage and Castro, Roberto L and Kuznedelev, Denis and Panferov, Andrei and Kurti{\'c}, Eldar and Pandit, Shubhra and Marques, Alexandre and Kurtz, Mark and Ashkboos, Saleh and Hoefler, Torsten and Alistarh, Dan},
+  booktitle={ICLR},
+  year={2026},
+  note={arXiv:2509.23202}
+}
+
+@inproceedings{blumenberg2026bof4,
+  title={Improving Block-Wise {LLM} Quantization by 4-bit Block-Wise Optimal Float ({BOF4}): Analysis and Variations},
+  author={Blumenberg, Patrick and Graave, Thomas and Fingscheidt, Tim},
+  booktitle={ICLR},
+  year={2026},
+  note={arXiv:2505.06653}
+}
+
+@article{meng2026arcquant,
+  title={{ARCQuant}: Boosting {NVFP4} Quantization with Augmented Residual Channels for {LLMs}},
+  author={Meng, Haoqian and others},
+  journal={arXiv:2601.07475},
+  year={2026}
+}
+
+@article{faar2026,
+  title={{FAAR}: Format-Aware Adaptive Rounding for {NVFP4} Quantization},
+  author={{Anonymous}},
+  journal={arXiv:2603.22370},
+  year={2026}
+}
+
+@article{blockdialect2025,
+  title={{BlockDialect}: Per-Block Format Selection from a {DialectFP4} Formatbook},
+  author={{Anonymous}},
+  journal={arXiv:2501.01144},
+  year={2025}
+}
+
+@article{quartet2025,
+  title={Quartet: Native {FP4} Training Can Be Optimal for Large Language Models},
+  author={Castro, Roberto L and Panferov, Andrei and others},
+  journal={arXiv:2505.14669},
+  year={2025}
+}
+
+@article{quartet2_2026,
+  title={Quartet {II}: Accurate {LLM} Pre-Training in {NVFP4} by Improved Unbiased Gradient Estimation},
+  author={Panferov, Andrei and Schultheis, Erik and Tabesh, Soroush and Alistarh, Dan},
+  journal={arXiv:2601.22813},
+  year={2026}
+}
+
+% --- Theoretical Foundations ---
+
+@article{ordentlich2024optquant,
+  title={Optimal Quantization for Matrix Multiplication},
+  author={Ordentlich, Or and Polyanskiy, Yury},
+  journal={arXiv:2410.13780},
+  year={2024}
+}
+
+@article{ordentlich2026highrate,
+  title={High-Rate Quantized Matrix Multiplication: Theory and Practice},
+  author={Ordentlich, Or and Polyanskiy, Yury},
+  journal={arXiv:2601.17187},
+  year={2026}
+}
+
+@article{lifar2026watersic,
+  title={{WaterSIC}: Information-Theoretically (Near) Optimal Linear Layer Quantization},
+  author={Lifar, Egor and Savkin, Semyon and Ordentlich, Or and Polyanskiy, Yury},
+  journal={arXiv:2603.04956},
+  year={2026}
+}
+
+@article{orr2025optformats,
+  title={Optimal Formats for Weight Quantisation},
+  author={Orr, Douglas and Ribar, Luka and Luschi, Carlo},
+  journal={arXiv:2505.12988},
+  year={2025}
+}
+
+@inproceedings{malinovskii2025higgs,
+  title={{HIGGS}: Pushing the Limits of Large Language Model Quantization via the Linearity Theorem},
+  author={Malinovskii, Vladimir and others},
+  booktitle={NAACL},
+  year={2025},
+  note={arXiv:2411.17525}
+}
+
+% --- Learned/Arbitrary Codebook Quantization ---
+
+@inproceedings{elhoushi2025any4,
+  title={{any4}: Learned 4-bit Numeric Representation for {LLMs}},
+  author={Elhoushi, Mostafa and Johnson, Jeff},
+  booktitle={ICML},
+  year={2025},
+  note={arXiv:2507.04610}
+}
+
+@article{vanderouderaa2026leechlattice,
+  title={Leech Lattice Vector Quantization for Efficient {LLM} Compression},
+  author={van der Ouderaa, Tycho F A and van Baalen, Mart and Whatmough, Paul and Nagel, Markus},
+  journal={arXiv:2603.11021},
+  year={2026}
+}
+
+@article{vptq2024,
+  title={{VPTQ}: Extreme Low-Bit Vector Post-Training Quantization for Large Language Models},
+  author={{Anonymous}},
+  journal={arXiv:2409.17066},
+  year={2024}
+}
+
+% --- Grid Optimization ---
+
+@article{kim2026twostagegrid,
+  title={Two-Stage Grid Optimization for Group-wise Quantization of {LLMs}},
+  author={Kim, Junhan and others},
+  journal={arXiv:2602.02126},
+  year={2026}
+}
+
+@article{elangovan2025lobcq,
+  title={{LO-BCQ}: Locally Optimal Block Clustered Quantization for 4-bit ({W4A4}) {LLM} Inference},
+  author={Elangovan, Reena and Sakr, Charbel and Raghunathan, Anand and Khailany, Brucek},
+  journal={TMLR},
+  year={2025},
+  note={arXiv:2502.05376}
+}
+
+% --- LUT-GEMM / Kernel Papers ---
+
+@inproceedings{lutgemm2024,
+  title={{LUT-GEMM}: Quantized Matrix Multiplication based on {LUTs} for Efficient Inference in Large-Scale Generative Language Models},
+  author={Park, Gunho and others},
+  booktitle={ICLR},
+  year={2024},
+  note={arXiv:2206.09557}
+}
+
+@inproceedings{guo2024flute,
+  title={{FLUTE}: Fast Matrix Multiplications for Lookup Table-Quantized {LLMs}},
+  author={Guo, Han and others},
+  booktitle={EMNLP Findings},
+  year={2024},
+  note={arXiv:2407.10960}
+}
+
+@inproceedings{tmac2025,
+  title={{T-MAC}: {CPU} Renaissance via Table Lookup for Low-Bit {LLM} Deployment on Edge},
+  author={{Microsoft Research}},
+  booktitle={EuroSys},
+  year={2025},
+  note={arXiv:2407.00088}
+}
+
+@inproceedings{lutensorcore2025,
+  title={{LUT Tensor Core}: A Software-Hardware Co-Design for {LUT}-Based Low-Bit {LLM} Inference},
+  author={{Anonymous}},
+  booktitle={ISCA},
+  year={2025},
+  note={arXiv:2408.06003}
+}
+
+% --- Entropy-Constrained / Classical ---
+
+@article{chou1989ecvq,
+  title={Entropy-Constrained Vector Quantization},
+  author={Chou, Philip A and Lookabaugh, Tom and Gray, Robert M},
+  journal={IEEE Trans. ASSP},
+  year={1989}
+}
+
+@inproceedings{idelbayev2021optscaledcodebook,
+  title={Optimal Quantization Using Scaled Codebook},
+  author={Idelbayev, Yerlan and Molchanov, Pavlo and Shen, Maying and Yin, Hongxu and Carreira-Perpi{\~n}{\'a}n, Miguel A and Alvarez, Jose M},
+  booktitle={CVPR},
+  year={2021}
+}

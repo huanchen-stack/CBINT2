@@ -103,7 +103,7 @@ class CodebookQuantizer:
         packed = (low_nibbles | (high_nibbles << 4)).to(torch.uint8)
         return packed.contiguous()
 
-    def fakequant_layer(
+    def _fakequant_layer_vanilla(
         self,
         weight_packed,
         weight_scale,
@@ -134,6 +134,46 @@ class CodebookQuantizer:
         quantized_blocks = self.fakequant_blocks(blocks)
         quantized_fp4 = quantized_blocks.reshape_as(fp4_values)
         return self.pack_fp4_to_uint8(quantized_fp4)
+
+    def fakequant_layer(
+        self,
+        weight_packed,
+        weight_scale,
+        weight_global_scale,
+    ):
+        if weight_packed.dtype != torch.uint8:
+            raise TypeError(f"weight_packed must be torch.uint8, got {weight_packed.dtype}")
+        if weight_packed.dim() != 2:
+            raise ValueError(f"weight_packed must be 2D [out, in//2], got {tuple(weight_packed.shape)}")
+
+        out_features, in_packed = weight_packed.shape
+        in_features = in_packed * 2
+        if in_features % 16 != 0:
+            raise ValueError(f"in_features ({in_features}) must be divisible by 16")
+
+        expected_scale_shape = (out_features, in_features // 16)
+        if tuple(weight_scale.shape) != expected_scale_shape:
+            raise ValueError(
+                f"weight_scale shape {tuple(weight_scale.shape)} does not match expected {expected_scale_shape}"
+            )
+        if weight_global_scale.numel() != 1:
+            raise ValueError(
+                f"weight_global_scale must contain exactly one element, got shape {tuple(weight_global_scale.shape)}"
+            )
+
+        fp4_values = self.unpack_uint8_to_fp4(weight_packed)
+        gscale = weight_global_scale.to(torch.float32).reshape(1)
+        scale_expanded = weight_scale.to(torch.float32).repeat_interleave(16, dim=1)
+        bf16_weights = fp4_values * scale_expanded / gscale
+
+        blocks = bf16_weights.reshape(-1, 16)
+        opt_fp4, opt_scale = self.fakequant_blocks_with_scale(blocks)
+
+        opt_fp4 = opt_fp4.reshape(out_features, in_features)
+        new_effective_scale = opt_scale.reshape(out_features, in_features // 16)
+        new_weight_scale = self._cast_scale_to_fp8(new_effective_scale * gscale)
+
+        return self.pack_fp4_to_uint8(opt_fp4), new_weight_scale
 
     def fakequant_blocks(self, fp4_values, return_mse: bool = False):
         if fp4_values.dim() != 2 or fp4_values.shape[1] != 16:
@@ -180,6 +220,40 @@ class CodebookQuantizer:
         return result
 
     @staticmethod
+    def _cast_scale_to_fp8(scale):
+        return scale.to(torch.float8_e4m3fn).to(torch.float32).clamp(min=1e-10)
+
+    def _round_to_fp4_indices(self, values):
+        fp4 = self.fp4_representable.to(device=values.device)
+        return (values.unsqueeze(-1) - fp4).abs().argmin(dim=-1)
+
+    def fakequant_blocks_with_scale(self, bf16_weights, max_iters=3):
+        if bf16_weights.dim() != 2 or bf16_weights.shape[1] != 16:
+            raise ValueError(
+                f"bf16_weights must have shape [num_blocks, 16], got {tuple(bf16_weights.shape)}"
+            )
+
+        w = bf16_weights.to(dtype=torch.float32)
+        device = w.device
+
+        fp4 = self.fp4_representable.to(device=device)
+        value_table = self._value_table.to(device=device)
+
+        s = self._cast_scale_to_fp8(w.abs().amax(dim=-1, keepdim=True) / 6.0)
+
+        for _ in range(max_iters):
+            scaled = w / s
+            fp4_idx = (scaled.unsqueeze(-1) - fp4).abs().argmin(dim=-1)
+            mapped = value_table[fp4_idx]
+            best_k = ((scaled.unsqueeze(-1) - mapped) ** 2).mean(dim=1).argmin(dim=-1)
+            q = mapped.gather(2, best_k.view(-1, 1, 1).expand(-1, 16, 1)).squeeze(2)
+            numer = (w * q).sum(dim=-1, keepdim=True)
+            denom = (q * q).sum(dim=-1, keepdim=True).clamp(min=1e-10)
+            s = self._cast_scale_to_fp8(numer / denom)
+
+        return q, s
+
+    @staticmethod
     def _fakequant_blocks_chunk(source, fp4, error_table, value_table):
         element_indices = (source.unsqueeze(-1) == fp4).int().argmax(dim=-1)
         element_errors = error_table[element_indices]
@@ -213,7 +287,7 @@ if __name__ == "__main__":
     weight_scale = torch.ones((out_features, in_features // 16), dtype=torch.float32)
     weight_global_scale = torch.ones((1,), dtype=torch.float32)
 
-    quantized_packed = quantizer.fakequant_layer(layer_packed, weight_scale, weight_global_scale)
+    quantized_packed = quantizer._fakequant_layer_vanilla(layer_packed, weight_scale, weight_global_scale)
     quantized_fp4 = quantizer.unpack_uint8_to_fp4(quantized_packed)
     quantized_blocks_from_layer = quantized_fp4.reshape(-1, 16)
     present_layer = (
@@ -227,5 +301,24 @@ if __name__ == "__main__":
     repacked = quantizer.pack_fp4_to_uint8(quantized_fp4)
     re_unpacked = quantizer.unpack_uint8_to_fp4(repacked)
     assert torch.equal(re_unpacked, quantized_fp4), "Unpack/pack/unpack roundtrip failed"
+
+    bf16_weights = torch.randn(256, 16)
+    opt_fp4, opt_scale = quantizer.fakequant_blocks_with_scale(bf16_weights)
+    for i in range(opt_fp4.shape[0]):
+        assert len(set(opt_fp4[i].tolist())) <= 4, f"Block {i} has more than 4 distinct values"
+    assert (opt_scale > 0).all(), "Some scales are non-positive"
+    opt_packed = quantizer.pack_fp4_to_uint8(opt_fp4.reshape(16, 256))
+    assert opt_packed.dtype == torch.uint8, "Pack output must be uint8"
+
+    scale_for_layer = torch.rand(out_features, in_features // 16).to(torch.float8_e4m3fn).to(torch.float32).clamp(min=0.01)
+    gscale_for_layer = torch.tensor([2.0], dtype=torch.float32)
+    opt_packed_layer, opt_scale_layer = quantizer.fakequant_layer(
+        layer_packed, scale_for_layer, gscale_for_layer
+    )
+    opt_layer_fp4 = quantizer.unpack_uint8_to_fp4(opt_packed_layer)
+    opt_layer_blocks = opt_layer_fp4.reshape(-1, 16)
+    for i in range(opt_layer_blocks.shape[0]):
+        assert len(set(opt_layer_blocks[i].tolist())) <= 4, f"Layer block {i} has more than 4 distinct values"
+    assert tuple(opt_scale_layer.shape) == (out_features, in_features // 16), "Scale shape mismatch"
 
     print("All fakequant.py self-tests passed.")
