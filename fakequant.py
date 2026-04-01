@@ -164,14 +164,14 @@ class CodebookQuantizer:
         fp4_values = self.unpack_uint8_to_fp4(weight_packed)
         gscale = weight_global_scale.to(torch.float32).reshape(1)
         scale_expanded = weight_scale.to(torch.float32).repeat_interleave(16, dim=1)
-        bf16_weights = fp4_values * scale_expanded / gscale
+        bf16_weights = fp4_values * scale_expanded * gscale
 
         blocks = bf16_weights.reshape(-1, 16)
         opt_fp4, opt_scale = self.fakequant_blocks_with_scale(blocks)
 
         opt_fp4 = opt_fp4.reshape(out_features, in_features)
         new_effective_scale = opt_scale.reshape(out_features, in_features // 16)
-        new_weight_scale = self._cast_scale_to_fp8(new_effective_scale * gscale)
+        new_weight_scale = self._cast_scale_to_fp8(new_effective_scale / gscale)
 
         return self.pack_fp4_to_uint8(opt_fp4), new_weight_scale.to(dtype=weight_scale.dtype)
 

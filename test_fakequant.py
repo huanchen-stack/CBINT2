@@ -127,6 +127,48 @@ print(f"  avg joint-opt codebook:   {avg_opt:.6f}  ({avg_opt / avg_nvfp4:.2f}x v
 print(f"  MSE reduction:            {(1 - avg_opt / avg_fixed) * 100:.1f}%")
 print(f"  blocks improved:          {blocks_improved}/{num_test_blocks}")
 
+print("\n=== Scale roundtrip: fakequant_layer dequant invariant ===")
+torch.manual_seed(99)
+out_f, in_f = 64, 768
+bf16_ref = torch.randn(out_f, in_f)
+FP8_MAX, FP4_MAX_VAL = 448.0, 6.0
+gscale_rt = torch.tensor(FP4_MAX_VAL * FP8_MAX / bf16_ref.abs().max().item(), dtype=torch.float32)
+weight_scale_2_rt = (1.0 / gscale_rt).reshape(())
+
+raw_scale = bf16_ref.reshape(out_f, in_f // 16, 16).abs().amax(dim=-1) / FP4_MAX_VAL
+weight_scale_rt = (raw_scale * gscale_rt).to(torch.float8_e4m3fn)
+
+eff_scale = weight_scale_rt.to(torch.float32) * weight_scale_2_rt.to(torch.float32)
+eff_expanded = eff_scale.repeat_interleave(16, dim=1)
+fp4_idx = (bf16_ref / eff_expanded).unsqueeze(-1).sub(q.fp4_representable).abs().argmin(dim=-1)
+fp4_orig = q.fp4_representable[fp4_idx]
+packed_rt = q.pack_fp4_to_uint8(fp4_orig)
+
+vanilla_packed = q._fakequant_layer_vanilla(packed_rt, weight_scale_rt, weight_scale_2_rt)
+vanilla_fp4 = q.unpack_uint8_to_fp4(vanilla_packed)
+vanilla_dequant = vanilla_fp4 * eff_expanded
+vanilla_mse = ((bf16_ref - vanilla_dequant) ** 2).mean().item()
+
+new_packed, new_ws = q.fakequant_layer(packed_rt, weight_scale_rt, weight_scale_2_rt)
+new_fp4 = q.unpack_uint8_to_fp4(new_packed)
+new_eff = new_ws.to(torch.float32) * weight_scale_2_rt.to(torch.float32)
+new_eff_expanded = new_eff.repeat_interleave(16, dim=1)
+dequant_new = new_fp4 * new_eff_expanded
+
+nvfp4_mse_rt = ((bf16_ref - fp4_orig * eff_expanded) ** 2).mean().item()
+new_mse = ((bf16_ref - dequant_new) ** 2).mean().item()
+
+print(f"  weight_scale_2:      {weight_scale_2_rt.item():.6f}  (reciprocal convention)")
+print(f"  weight_scale dtype:  {weight_scale_rt.dtype}")
+print(f"  new_scale dtype:     {new_ws.dtype}")
+assert new_ws.dtype == weight_scale_rt.dtype, f"Scale dtype changed: {weight_scale_rt.dtype} -> {new_ws.dtype}"
+print(f"  NVFP4 MSE:           {nvfp4_mse_rt:.6f}")
+print(f"  vanilla codebook:    {vanilla_mse:.6f}  ({vanilla_mse / nvfp4_mse_rt:.2f}x vs NVFP4)")
+print(f"  scale-opt codebook:  {new_mse:.6f}  ({new_mse / nvfp4_mse_rt:.2f}x vs NVFP4)")
+assert new_mse <= vanilla_mse * 1.01, f"Scale-opt worse than vanilla: {new_mse:.6f} > {vanilla_mse:.6f}"
+print(f"  vs vanilla:          {(1 - new_mse / vanilla_mse) * 100:.1f}% MSE reduction")
+print(f"  PASS: scale roundtrip correct, dequant = fp4 * weight_scale * weight_scale_2")
+
 print("\n=== Full layer fakequant vanilla (32x512) ===")
 layer_fp4 = q.fp4_representable[torch.randint(0, 15, (32, 512))]
 layer_packed = q.pack_fp4_to_uint8(layer_fp4)
