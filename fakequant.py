@@ -219,9 +219,11 @@ class CodebookQuantizer:
             return result[0]
         return result
 
+    FP8_E4M3_MAX: Final[float] = 448.0
+
     @staticmethod
     def _cast_scale_to_fp8(scale):
-        return scale.to(torch.float8_e4m3fn).to(torch.float32).clamp(min=1e-10)
+        return scale.clamp(-448.0, 448.0).to(torch.float8_e4m3fn).to(torch.float32).clamp(min=1e-10)
 
     def _round_to_fp4_indices(self, values):
         fp4 = self.fp4_representable.to(device=values.device)
