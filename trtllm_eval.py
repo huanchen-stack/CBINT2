@@ -88,8 +88,8 @@ TASK_REGISTRY: dict[str, dict[str, Any]] = {
 DEFAULT_TASKS = ["mmlu"]
 
 DEFAULT_MODELS = [
-    # "models/Qwen3-30B-A3B-NVFP4",
-    "models/Qwen3-30B-A3B-NVFP4-CBINT2",
+    # "/data/models/Qwen3-30B-A3B-NVFP4",
+    "/data/models/Qwen3-30B-A3B-NVFP4-CBINT2",
 ]
 
 # ---------------------------------------------------------------------------

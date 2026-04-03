@@ -116,7 +116,7 @@ def main():
                         help="Download only, do not re-shard by transformer block")
     args = parser.parse_args()
 
-    output_dir = args.output_dir or f"./models/{args.model_id.split('/')[-1]}"
+    output_dir = args.output_dir or f"/data/models/{args.model_id.split('/')[-1]}"
     output_path = Path(output_dir)
 
     print(f"Downloading {args.model_id} to {output_dir}...")

@@ -312,7 +312,7 @@ def run(
     device: str,
     mlp_only: bool,
     dry_run: bool,
-    hessian_dir: str = "hessians",
+    hessian_dir: str = "/data/hessians",
     output_format: str | None = None,
     num_gpus: int = 1,
 ) -> None:
@@ -425,7 +425,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Apply GPTQ-optimized codebook quantization to NVFP4 or BF16 layers."
     )
-    default_input = "models/Qwen3-30B-A3B-NVFP4"
+    default_input = "/data/models/Qwen3-30B-A3B-NVFP4"
     default_output = default_input + "-CBINT2-GPTQ"
     parser.add_argument("--input-path", type=str, default=default_input)
     parser.add_argument("--output-path", type=str, default=default_output)

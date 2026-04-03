@@ -5,7 +5,7 @@ from pathlib import Path
 from safetensors import safe_open
 
 def main():
-    orig_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("models/Qwen3-30B-A3B-NVFP4")
+    orig_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("/data/models/Qwen3-30B-A3B-NVFP4")
     cbint_path = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(str(orig_path) + "-CBINT2")
 
     with open(orig_path / "model.safetensors.index.json") as f:

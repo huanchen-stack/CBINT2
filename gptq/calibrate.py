@@ -219,7 +219,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Collect per-layer Hessians for GPTQ calibration.")
     parser.add_argument("--model-path", type=str, default=DEFAULT_MODEL_PATH,
                         help=f"HuggingFace model path (default: {DEFAULT_MODEL_PATH})")
-    parser.add_argument("--output-dir", type=str, default="hessians",
+    parser.add_argument("--output-dir", type=str, default="/data/hessians",
                         help="Directory to save Hessian .pt files")
     parser.add_argument("--num-samples", type=int, default=128,
                         help="Number of calibration sequences (default: 128)")

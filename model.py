@@ -11,7 +11,7 @@ def main():
     ]
     sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
 
-    llm = LLM(model="models/Qwen3-30B-A3B-NVFP4", tensor_parallel_size=1)
+    llm = LLM(model="/data/models/Qwen3-30B-A3B-NVFP4", tensor_parallel_size=1)
 
     outputs = llm.generate(prompts, sampling_params)
 

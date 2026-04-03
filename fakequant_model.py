@@ -500,7 +500,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Apply codebook fake-quantization to quantized or BF16 layers."
     )
-    default_input = "models/Qwen3-30B-A3B-NVFP4"
+    default_input = "/data/models/Qwen3-30B-A3B-NVFP4"
     default_output = default_input + "-CBINT2"
     parser.add_argument("--input-path", type=str, default=default_input)
     parser.add_argument("--output-path", type=str, default=default_output)
