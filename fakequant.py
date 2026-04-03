@@ -229,7 +229,7 @@ class CodebookQuantizer:
         fp4 = self.fp4_representable.to(device=values.device)
         return (values.unsqueeze(-1) - fp4).abs().argmin(dim=-1)
 
-    def fakequant_blocks_with_scale(self, bf16_weights):
+    def fakequant_blocks_with_scale(self, bf16_weights, return_codebook_idx: bool = False):
         if bf16_weights.dim() != 2 or bf16_weights.shape[1] != 16:
             raise ValueError(
                 f"bf16_weights must have shape [num_blocks, 16], got {tuple(bf16_weights.shape)}"
@@ -258,6 +258,8 @@ class CodebookQuantizer:
         q = q_all.gather(2, best_k.view(-1, 1, 1).expand(-1, 16, 1)).squeeze(2)
         s = s_all.gather(1, best_k.unsqueeze(1))
 
+        if return_codebook_idx:
+            return q, s, best_k
         return q, s
 
     def fakequant_layer_bf16(self, bf16_weights: torch.Tensor) -> torch.Tensor:

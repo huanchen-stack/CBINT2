@@ -58,7 +58,10 @@ class CodebookGPTQ:
         H_inv_cho = self._get_hessian_inverse()
 
         all_fp4 = torch.zeros_like(W)
+        all_fp4_phase1 = torch.zeros_like(W)
         all_scales = torch.zeros(out_features, in_features // 16, device=W.device)
+
+        codebook = self.quantizer.codebook.to(W.device)
 
         for c1 in range(0, in_features, self.block_size):
             c2 = min(c1 + self.block_size, in_features)
@@ -70,27 +73,40 @@ class CodebookGPTQ:
                 g_end = min(g + 16, c2 - c1)
                 w_group = w_blk[:, g:g_end]
 
-                q_fp4, s_opt = self.quantizer.fakequant_blocks_with_scale(
+                q_phase1, s_opt, best_k = self.quantizer.fakequant_blocks_with_scale(
                     w_group.reshape(-1, 16),
+                    return_codebook_idx=True,
                 )
-                w_q = (q_fp4 * s_opt).reshape_as(w_group)
+                all_fp4_phase1[:, c1 + g:c1 + g_end] = q_phase1.reshape_as(w_group)
+                s_opt = s_opt.reshape(out_features, 1)
+                cb_vals = codebook[best_k]
 
-                all_fp4[:, c1 + g:c1 + g_end] = q_fp4.reshape_as(w_group)
-                all_scales[:, (c1 + g) // 16] = s_opt.reshape(out_features)
+                group_fp4 = torch.zeros(out_features, g_end - g, device=W.device)
 
                 for j in range(g_end - g):
                     col = g + j
+                    w_col = w_blk[:, col]
+                    scaled_col = w_col / s_opt.squeeze(1)
+                    dists = (scaled_col.unsqueeze(-1) - cb_vals).abs()
+                    nearest_idx = dists.argmin(dim=-1)
+                    q_col = cb_vals[torch.arange(out_features, device=W.device), nearest_idx]
+                    group_fp4[:, j] = q_col
+
+                    w_q_col = q_col * s_opt.squeeze(1)
                     d = H_blk[col, col]
-                    err = (w_blk[:, col] - w_q[:, j]) / d
+                    err = (w_blk[:, col] - w_q_col) / d
                     if col + 1 < c2 - c1:
                         w_blk[:, col + 1:].addr_(err, H_blk[col, col + 1:], alpha=-1)
                     errs[:, col] = err
+
+                all_fp4[:, c1 + g:c1 + g_end] = group_fp4
+                all_scales[:, (c1 + g) // 16] = s_opt.reshape(out_features)
 
             if c2 < in_features:
                 W[:, c2:].addmm_(errs, H_inv_cho[c1:c2, c2:], alpha=-1)
 
         W_q = all_fp4 * all_scales.repeat_interleave(16, dim=1)
-        return all_fp4, all_scales, W_q
+        return all_fp4, all_scales, W_q, all_fp4_phase1
 
     @torch.no_grad()
     def _get_hessian_inverse(self) -> torch.Tensor:
