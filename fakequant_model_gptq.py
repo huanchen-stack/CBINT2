@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 import torch
+import torch.multiprocessing as mp
 from safetensors.torch import load_file, save_file
 
 from fakequant import CodebookQuantizer
@@ -59,6 +60,124 @@ def _validate_local_calibration_artifacts(
         raise FileNotFoundError(
             _format_missing_layers(missing_hessians, "Hessian entries", artifact_dir)
             + ". Run `python -m gptq.calibrate --output-dir ...` first."
+        )
+
+
+def _process_block_on_gpu(
+    gpu_id: int,
+    block_idx: int,
+    block_layers: list[str],
+    input_path: Path,
+    output_path: Path,
+    weight_map: dict[str, str],
+    calibration_dir: Path,
+    input_format: str,
+    output_format: str,
+) -> None:
+    device = torch.device(f"cuda:{gpu_id}")
+    quantizer = CodebookQuantizer()
+
+    shard_to_layers: dict[str, list[str]] = {}
+    for base in block_layers:
+        weight_name = _resolve_weight_name(base, weight_map)
+        shard_file = weight_map[weight_name]
+        shard_to_layers.setdefault(shard_file, []).append(base)
+
+    for shard_rel, layers_in_shard in shard_to_layers.items():
+        input_shard = input_path / shard_rel
+        output_shard = output_path / shard_rel
+        output_shard.parent.mkdir(parents=True, exist_ok=True)
+
+        tensors = load_file(str(input_shard), device="cpu")
+
+        for base in layers_in_shard:
+            weight_name = _resolve_weight_name(base, weight_map)
+            scale_name = f"{base}.weight_scale"
+            gscale_name = _resolve_gscale_name(base, weight_map)
+
+            gscale_for_output = torch.tensor([1.0], device=device)
+            if input_format == "bf16":
+                w = tensors[weight_name].to(device=device, dtype=torch.float32)
+                _, in_features = w.shape
+                ref_mode = "bf16"
+            else:
+                packed_cpu = tensors[weight_name]
+                scale_cpu = tensors.get(scale_name)
+                if scale_cpu is None:
+                    scale_cpu = _load_tensor_from_specific_shard(
+                        input_path, weight_map[scale_name], scale_name
+                    )
+                gscale_cpu = tensors.get(gscale_name)
+                if gscale_cpu is None:
+                    gscale_cpu = _load_tensor_from_specific_shard(
+                        input_path, weight_map[gscale_name], gscale_name
+                    )
+                packed = packed_cpu.to(device=device)
+                scale = scale_cpu.to(device=device)
+                gscale_for_output = gscale_cpu.to(device=device, dtype=torch.float32).reshape(1)
+                fp4_values = quantizer.unpack_uint8_to_fp4(packed)
+                _, in_features = fp4_values.shape
+                scale_expanded = scale.to(torch.float32).repeat_interleave(16, dim=1)
+                w = fp4_values * scale_expanded * gscale_for_output
+                ref_mode = "nvfp4"
+
+            gptq = CodebookGPTQ(in_features=in_features, quantizer=quantizer)
+
+            hessian = load_hessian(calibration_dir, base)
+            if hessian is None:
+                raise FileNotFoundError(f"Missing Hessian for {base} in {calibration_dir}")
+            gptq.H = hessian.to(device)
+            gptq.num_samples = 1
+
+            print(f"  [GPU {gpu_id}] gptq({ref_mode})→{output_format} {base}")
+
+            fp4_out, scales_out, _ = gptq.quantize(w)
+
+            if output_format == "bf16":
+                dequantized = (fp4_out * scales_out).to(dtype=torch.bfloat16)
+                tensors[weight_name] = dequantized.to(device="cpu")
+                for drop_key in [scale_name, gscale_name]:
+                    tensors.pop(drop_key, None)
+            else:
+                gscale_val = gscale_for_output
+                new_packed = quantizer.pack_fp4_to_uint8(fp4_out)
+                new_weight_scale = quantizer._cast_scale_to_fp8(scales_out / gscale_val)
+                tensors[weight_name] = new_packed.to(device="cpu")
+                tensors[scale_name] = new_weight_scale.to(dtype=torch.float8_e4m3fn, device="cpu")
+                if input_format == "bf16":
+                    tensors[f"{base}.weight_scale_2"] = gscale_val.to(device="cpu")
+
+            del gptq, w, hessian
+            torch.cuda.empty_cache()
+
+        save_file(tensors, str(output_shard))
+        print(f"  [GPU {gpu_id}] Saved: {shard_rel}")
+
+
+def _gpu_worker(
+    gpu_id: int,
+    block_indices: list[int],
+    layers_by_block: dict[int, list[str]],
+    input_path: Path,
+    output_path: Path,
+    weight_map: dict[str, str],
+    calibration_dir: Path,
+    input_format: str,
+    output_format: str,
+) -> None:
+    torch.cuda.set_device(gpu_id)
+    for block_idx in block_indices:
+        block_layers = layers_by_block[block_idx]
+        _process_block_on_gpu(
+            gpu_id=gpu_id,
+            block_idx=block_idx,
+            block_layers=block_layers,
+            input_path=input_path,
+            output_path=output_path,
+            weight_map=weight_map,
+            calibration_dir=calibration_dir,
+            input_format=input_format,
+            output_format=output_format,
         )
 
 
@@ -195,6 +314,7 @@ def run(
     dry_run: bool,
     hessian_dir: str = "hessians",
     output_format: str | None = None,
+    num_gpus: int = 1,
 ) -> None:
     if not input_path.exists() or not input_path.is_dir():
         raise FileNotFoundError(f"Input path does not exist or is not a directory: {input_path}")
@@ -240,23 +360,62 @@ def run(
         )
         return
 
-    resolved_device = torch.device(device)
-    quantizer = CodebookQuantizer()
     start_time = time.perf_counter()
-
     _copy_non_safetensors_files(input_path, output_path)
-    _process_shards_gptq(
-        input_path=input_path,
-        output_path=output_path,
-        weight_map=weight_map,
-        target_layers=target_layers,
-        quantizer=quantizer,
-        device=resolved_device,
-        calibration_dir=hessian_path,
-        dry_run=False,
-        input_format=input_format,
-        output_format=output_format,
-    )
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    layers_by_block = _group_layers_by_block(target_layers)
+    sorted_blocks = sorted(layers_by_block.keys())
+    effective_gpus = min(num_gpus, len(sorted_blocks), max(1, torch.cuda.device_count()))
+
+    print(f"\n{effective_gpus} GPU(s), {len(sorted_blocks)} blocks")
+    gpu_assignments: list[list[int]] = [[] for _ in range(effective_gpus)]
+    for i, block_idx in enumerate(sorted_blocks):
+        gpu_assignments[i % effective_gpus].append(block_idx)
+
+    for gpu_id, blocks in enumerate(gpu_assignments):
+        if blocks:
+            block_range = f"{blocks[0]}-{blocks[-1]}" if len(blocks) > 1 else str(blocks[0])
+            print(f"  GPU {gpu_id}: blocks [{block_range}] ({len(blocks)} blocks)")
+
+    ctx = mp.get_context("spawn")
+    processes: list[mp.Process] = []
+    for gpu_id in range(effective_gpus):
+        if not gpu_assignments[gpu_id]:
+            continue
+        p = ctx.Process(
+            target=_gpu_worker,
+            args=(
+                gpu_id,
+                gpu_assignments[gpu_id],
+                layers_by_block,
+                input_path,
+                output_path,
+                weight_map,
+                hessian_path,
+                input_format,
+                output_format,
+            ),
+        )
+        processes.append(p)
+        p.start()
+
+    for p in processes:
+        p.join()
+        if p.exitcode != 0:
+            raise RuntimeError(f"GPU worker {p.name} failed with exit code {p.exitcode}")
+
+    block_shard_files = set()
+    for block_idx in sorted_blocks:
+        for base in layers_by_block[block_idx]:
+            weight_name = _resolve_weight_name(base, weight_map)
+            block_shard_files.add(weight_map[weight_name])
+    for shard_file in set(weight_map.values()) - block_shard_files:
+        output_shard = output_path / shard_file
+        if not output_shard.exists():
+            tensors = load_file(str(input_path / shard_file), device="cpu")
+            save_file(tensors, str(output_shard))
+            print(f"Copied non-block shard: {shard_file}")
 
     elapsed = time.perf_counter() - start_time
     print(f"Done. Total elapsed time: {elapsed:.2f}s")
@@ -277,6 +436,8 @@ def main() -> None:
                         help="Local calibration directory produced by `python -m gptq.calibrate --output-dir ...`")
     parser.add_argument("--output-format", type=str, default=None, choices=["nvfp4", "bf16"],
                         help="Output format (default: auto-detect from GPU or CBINT2_COMPUTE_CAP env)")
+    parser.add_argument("--num-gpus", type=int, default=1,
+                        help="Number of GPUs for parallel block processing (default: 1)")
     args = parser.parse_args()
 
     run(
@@ -287,6 +448,7 @@ def main() -> None:
         dry_run=args.dry_run,
         hessian_dir=args.hessian_dir,
         output_format=args.output_format,
+        num_gpus=args.num_gpus,
     )
 
 

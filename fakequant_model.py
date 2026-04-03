@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 import torch
+import torch.multiprocessing as mp
 from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
@@ -275,7 +276,130 @@ def _process_shards(
             print(f"[{shard_idx}/{len(shard_order)}] Saved: {shard_rel}")
 
 
-def run(input_path: Path, output_path: Path, device: str, mlp_only: bool, dry_run: bool, vanilla: bool = False, output_format: str | None = None) -> None:
+def _group_layers_by_block(target_layers: list[str]) -> dict[int, list[str]]:
+    from gptq.calibrate import layer_block_index
+    layers_by_block: dict[int, list[str]] = {}
+    for layer_name in target_layers:
+        block_idx = layer_block_index(layer_name)
+        if block_idx is not None:
+            layers_by_block.setdefault(block_idx, []).append(layer_name)
+    return layers_by_block
+
+
+def _process_block_on_gpu(
+    gpu_id: int,
+    block_layers: list[str],
+    input_path: Path,
+    output_path: Path,
+    weight_map: dict[str, str],
+    input_format: str,
+    output_format: str,
+    vanilla: bool,
+) -> None:
+    device = torch.device(f"cuda:{gpu_id}")
+    quantizer = CodebookQuantizer()
+
+    shard_to_layers: dict[str, list[str]] = {}
+    for base in block_layers:
+        weight_name = _resolve_weight_name(base, weight_map)
+        shard_file = weight_map[weight_name]
+        shard_to_layers.setdefault(shard_file, []).append(base)
+
+    for shard_rel, layers_in_shard in shard_to_layers.items():
+        input_shard = input_path / shard_rel
+        output_shard = output_path / shard_rel
+        output_shard.parent.mkdir(parents=True, exist_ok=True)
+
+        tensors = load_file(str(input_shard), device="cpu")
+
+        for base in layers_in_shard:
+            weight_name = _resolve_weight_name(base, weight_map)
+
+            if input_format == "bf16":
+                bf16_cpu = tensors[weight_name]
+                if output_format == "bf16":
+                    print(f"  [GPU {gpu_id}] bf16→bf16 {base}")
+                    quantized = quantizer.fakequant_layer_bf16(bf16_cpu.to(device=device))
+                    tensors[weight_name] = quantized.to(device="cpu")
+                else:
+                    print(f"  [GPU {gpu_id}] bf16→nvfp4 {base}")
+                    w = bf16_cpu.to(device=device, dtype=torch.float32)
+                    blocks = w.reshape(-1, 16)
+                    opt_fp4, opt_scale = quantizer.fakequant_blocks_with_scale(blocks)
+                    out_features, in_features = w.shape
+                    opt_fp4 = opt_fp4.reshape(out_features, in_features)
+                    new_scale = opt_scale.reshape(out_features, in_features // 16)
+                    gscale = torch.tensor([1.0], dtype=torch.float32, device=device)
+                    new_weight_scale = quantizer._cast_scale_to_fp8(new_scale / gscale)
+                    tensors[weight_name] = quantizer.pack_fp4_to_uint8(opt_fp4).to(device="cpu")
+                    tensors[f"{base}.weight_scale"] = new_weight_scale.to(dtype=torch.float8_e4m3fn, device="cpu")
+                    tensors[f"{base}.weight_scale_2"] = gscale.to(device="cpu")
+            else:
+                scale_name = f"{base}.weight_scale"
+                gscale_name = _resolve_gscale_name(base, weight_map)
+                packed_cpu = tensors[weight_name]
+                scale_cpu = tensors.get(scale_name)
+                if scale_cpu is None:
+                    scale_cpu = _load_tensor_from_specific_shard(input_path, weight_map[scale_name], scale_name)
+                gscale_cpu = tensors.get(gscale_name)
+                if gscale_cpu is None:
+                    gscale_cpu = _load_tensor_from_specific_shard(input_path, weight_map[gscale_name], gscale_name)
+
+                if output_format == "bf16":
+                    print(f"  [GPU {gpu_id}] nvfp4→bf16 {base}")
+                    fp4_values = quantizer.unpack_uint8_to_fp4(packed_cpu.to(device=device))
+                    gscale = gscale_cpu.to(device=device, dtype=torch.float32).reshape(1)
+                    scale_expanded = scale_cpu.to(device=device, dtype=torch.float32).repeat_interleave(16, dim=1)
+                    bf16_weights = fp4_values * scale_expanded * gscale
+                    quantized = quantizer.fakequant_layer_bf16(bf16_weights)
+                    tensors[weight_name] = quantized.to(device="cpu")
+                    for drop_key in [scale_name, gscale_name]:
+                        tensors.pop(drop_key, None)
+                else:
+                    mode = "fakequant" if vanilla else "fakequant+scale"
+                    print(f"  [GPU {gpu_id}] {mode} {base}")
+                    if vanilla:
+                        quantized_packed = quantizer._fakequant_layer_vanilla(
+                            packed_cpu.to(device=device), scale_cpu.to(device=device), gscale_cpu.to(device=device))
+                        tensors[weight_name] = quantized_packed.to(device="cpu")
+                    else:
+                        quantized_packed, new_scale = quantizer.fakequant_layer(
+                            packed_cpu.to(device=device), scale_cpu.to(device=device), gscale_cpu.to(device=device))
+                        tensors[weight_name] = quantized_packed.to(device="cpu")
+                        tensors[scale_name] = new_scale.to(device="cpu")
+
+            torch.cuda.empty_cache()
+
+        save_file(tensors, str(output_shard))
+        print(f"  [GPU {gpu_id}] Saved: {shard_rel}")
+
+
+def _gpu_worker(
+    gpu_id: int,
+    block_indices: list[int],
+    layers_by_block: dict[int, list[str]],
+    input_path: Path,
+    output_path: Path,
+    weight_map: dict[str, str],
+    input_format: str,
+    output_format: str,
+    vanilla: bool,
+) -> None:
+    torch.cuda.set_device(gpu_id)
+    for block_idx in block_indices:
+        _process_block_on_gpu(
+            gpu_id=gpu_id,
+            block_layers=layers_by_block[block_idx],
+            input_path=input_path,
+            output_path=output_path,
+            weight_map=weight_map,
+            input_format=input_format,
+            output_format=output_format,
+            vanilla=vanilla,
+        )
+
+
+def run(input_path: Path, output_path: Path, device: str, mlp_only: bool, dry_run: bool, vanilla: bool = False, output_format: str | None = None, num_gpus: int = 1) -> None:
     if not input_path.exists() or not input_path.is_dir():
         raise FileNotFoundError(f"Input path does not exist or is not a directory: {input_path}")
 
@@ -311,23 +435,62 @@ def run(input_path: Path, output_path: Path, device: str, mlp_only: bool, dry_ru
         )
         return
 
-    resolved_device = torch.device(device)
-    quantizer = CodebookQuantizer()
     start_time = time.perf_counter()
-
     _copy_non_safetensors_files(input_path, output_path)
-    _process_shards(
-        input_path=input_path,
-        output_path=output_path,
-        weight_map=weight_map,
-        target_layers=target_layers,
-        quantizer=quantizer,
-        device=resolved_device,
-        dry_run=False,
-        vanilla=vanilla,
-        input_format=input_format,
-        output_format=output_format,
-    )
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    layers_by_block = _group_layers_by_block(target_layers)
+    sorted_blocks = sorted(layers_by_block.keys())
+    effective_gpus = min(num_gpus, len(sorted_blocks), max(1, torch.cuda.device_count()))
+
+    print(f"\n{effective_gpus} GPU(s), {len(sorted_blocks)} blocks")
+    gpu_assignments: list[list[int]] = [[] for _ in range(effective_gpus)]
+    for i, block_idx in enumerate(sorted_blocks):
+        gpu_assignments[i % effective_gpus].append(block_idx)
+
+    for gpu_id, blocks in enumerate(gpu_assignments):
+        if blocks:
+            block_range = f"{blocks[0]}-{blocks[-1]}" if len(blocks) > 1 else str(blocks[0])
+            print(f"  GPU {gpu_id}: blocks [{block_range}] ({len(blocks)} blocks)")
+
+    ctx = mp.get_context("spawn")
+    processes: list[mp.Process] = []
+    for gpu_id in range(effective_gpus):
+        if not gpu_assignments[gpu_id]:
+            continue
+        p = ctx.Process(
+            target=_gpu_worker,
+            args=(
+                gpu_id,
+                gpu_assignments[gpu_id],
+                layers_by_block,
+                input_path,
+                output_path,
+                weight_map,
+                input_format,
+                output_format,
+                vanilla,
+            ),
+        )
+        processes.append(p)
+        p.start()
+
+    for p in processes:
+        p.join()
+        if p.exitcode != 0:
+            raise RuntimeError(f"GPU worker {p.name} failed with exit code {p.exitcode}")
+
+    block_shard_files = set()
+    for block_idx in sorted_blocks:
+        for base in layers_by_block[block_idx]:
+            weight_name = _resolve_weight_name(base, weight_map)
+            block_shard_files.add(weight_map[weight_name])
+    for shard_file in set(weight_map.values()) - block_shard_files:
+        output_shard = output_path / shard_file
+        if not output_shard.exists():
+            tensors = load_file(str(input_path / shard_file), device="cpu")
+            save_file(tensors, str(output_shard))
+            print(f"Copied non-block shard: {shard_file}")
 
     elapsed = time.perf_counter() - start_time
     print(f"Done. Total elapsed time: {elapsed:.2f}s")
@@ -350,6 +513,8 @@ def main() -> None:
                         help="Use vanilla codebook selection without scale optimization")
     parser.add_argument("--output-format", type=str, default=None, choices=["nvfp4", "bf16"],
                         help="Output format (default: auto-detect from GPU or CBINT2_COMPUTE_CAP env)")
+    parser.add_argument("--num-gpus", type=int, default=1,
+                        help="Number of GPUs for parallel block processing (default: 1)")
     args = parser.parse_args()
 
     run(
@@ -360,6 +525,7 @@ def main() -> None:
         dry_run=args.dry_run,
         vanilla=args.vanilla,
         output_format=args.output_format,
+        num_gpus=args.num_gpus,
     )
 
 

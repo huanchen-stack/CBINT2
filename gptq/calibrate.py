@@ -17,7 +17,7 @@ DEFAULT_DATASET_NAME = "wikitext"
 DEFAULT_DATASET_CONFIG = "wikitext-2-raw-v1"
 MLP_SUFFIXES = (".mlp.gate_proj", ".mlp.up_proj", ".mlp.down_proj")
 EXPERT_MLP_PATTERN = ".mlp.experts."
-DEFAULT_CAL_BATCH_SIZE = 4
+DEFAULT_CAL_BATCH_SIZE = 16
 
 
 def tokenize_wikitext(tokenizer, num_samples: int = 128, seq_len: int = 2048) -> list[torch.Tensor]:
