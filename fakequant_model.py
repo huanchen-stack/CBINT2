@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import time
 from pathlib import Path
@@ -85,7 +86,9 @@ def _find_quantized_layers(weight_map: dict[str, str]) -> list[str]:
         scale = f"{base}.weight_scale"
         gscale_packed = f"{base}.weight_global_scale"
         gscale_alt = f"{base}.weight_scale_2"
-        if scale in weight_map and (gscale_packed in weight_map or gscale_alt in weight_map):
+        if scale in weight_map and (
+            gscale_packed in weight_map or gscale_alt in weight_map
+        ):
             bases.append(base)
     return bases
 
@@ -136,6 +139,37 @@ def _resolve_gscale_name(base: str, weight_map: dict[str, str]) -> str:
     return f"{base}.weight_scale_2"
 
 
+def _sanitize_layer_name(name: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9._-]", "_", name)
+
+
+def _load_global_scales(path: Path) -> dict[str, torch.Tensor]:
+    scales = load_file(str(path), device="cpu")
+    result: dict[str, torch.Tensor] = {}
+    for key, val in scales.items():
+        base = key.removesuffix(".weight_scale_2").removesuffix(".weight_global_scale")
+        result[base] = val.to(torch.float32).reshape(1)
+    return result
+
+
+def _apply_layer_codebook(
+    quantizer: CodebookQuantizer,
+    codebook_dir: Path,
+    layer_name: str,
+    default_codebook: torch.Tensor,
+) -> None:
+    sanitized = _sanitize_layer_name(layer_name)
+    cb_path = codebook_dir / f"{sanitized}.pt"
+    if cb_path.exists():
+        cb = torch.load(str(cb_path), weights_only=True)
+        quantizer.set_codebook(cb)
+    else:
+        print(
+            f"Warning: No codebook found for layer '{layer_name}' at {cb_path}. Using default codebook."
+        )
+        quantizer.set_codebook(default_codebook)
+
+
 def _copy_non_safetensors_files(input_path: Path, output_path: Path) -> None:
     output_path.mkdir(parents=True, exist_ok=True)
     for src in input_path.iterdir():
@@ -147,7 +181,9 @@ def _copy_non_safetensors_files(input_path: Path, output_path: Path) -> None:
         shutil.copy2(src, dst)
 
 
-def _load_tensor_from_specific_shard(model_path: Path, shard_rel: str, tensor_name: str) -> torch.Tensor:
+def _load_tensor_from_specific_shard(
+    model_path: Path, shard_rel: str, tensor_name: str
+) -> torch.Tensor:
     shard_path = model_path / shard_rel
     with safe_open(str(shard_path), framework="pt", device="cpu") as f:
         return f.get_tensor(tensor_name)
@@ -186,8 +222,7 @@ def _process_shards(
 
         tensors = load_file(str(input_shard), device="cpu")
         shard_targets = sorted(
-            b for b in target_layers
-            if _resolve_weight_name(b, weight_map) in tensors
+            b for b in target_layers if _resolve_weight_name(b, weight_map) in tensors
         )
 
         if not shard_targets:
@@ -195,7 +230,9 @@ def _process_shards(
                 save_file(tensors, str(output_shard))
             continue
 
-        print(f"[{shard_idx}/{len(shard_order)}] {shard_rel}  ({len(shard_targets)} target layers)")
+        print(
+            f"[{shard_idx}/{len(shard_order)}] {shard_rel}  ({len(shard_targets)} target layers)"
+        )
 
         for base in shard_targets:
             weight_name = _resolve_weight_name(base, weight_map)
@@ -203,14 +240,18 @@ def _process_shards(
 
             if dry_run:
                 t = tensors[weight_name]
-                print(f"  [{idx}/{len(target_layers)}] {base}  dtype={t.dtype}  shape={tuple(t.shape)}")
+                print(
+                    f"  [{idx}/{len(target_layers)}] {base}  dtype={t.dtype}  shape={tuple(t.shape)}"
+                )
                 continue
 
             if input_format == "bf16":
                 bf16_cpu = tensors[weight_name]
                 if output_format == "bf16":
                     print(f"  [{idx}/{len(target_layers)}] bf16→bf16 {base}")
-                    quantized = quantizer.fakequant_layer_bf16(bf16_cpu.to(device=device))
+                    quantized = quantizer.fakequant_layer_bf16(
+                        bf16_cpu.to(device=device)
+                    )
                     tensors[weight_name] = quantized.to(device="cpu")
                 else:
                     print(f"  [{idx}/{len(target_layers)}] bf16→nvfp4 {base}")
@@ -222,8 +263,12 @@ def _process_shards(
                     new_scale = opt_scale.reshape(out_features, in_features // 16)
                     gscale = torch.tensor([1.0], dtype=torch.float32, device=device)
                     new_weight_scale = quantizer._cast_scale_to_fp8(new_scale / gscale)
-                    tensors[weight_name] = quantizer.pack_fp4_to_uint8(opt_fp4).to(device="cpu")
-                    tensors[f"{base}.weight_scale"] = new_weight_scale.to(dtype=torch.float8_e4m3fn, device="cpu")
+                    tensors[weight_name] = quantizer.pack_fp4_to_uint8(opt_fp4).to(
+                        device="cpu"
+                    )
+                    tensors[f"{base}.weight_scale"] = new_weight_scale.to(
+                        dtype=torch.float8_e4m3fn, device="cpu"
+                    )
                     tensors[f"{base}.weight_scale_2"] = gscale.to(device="cpu")
             else:
                 scale_name = f"{base}.weight_scale"
@@ -244,9 +289,15 @@ def _process_shards(
 
                 if output_format == "bf16":
                     print(f"  [{idx}/{len(target_layers)}] nvfp4→bf16 {base}")
-                    fp4_values = quantizer.unpack_uint8_to_fp4(packed_cpu.to(device=device))
-                    gscale = gscale_cpu.to(device=device, dtype=torch.float32).reshape(1)
-                    scale_expanded = scale_cpu.to(device=device, dtype=torch.float32).repeat_interleave(16, dim=1)
+                    fp4_values = quantizer.unpack_uint8_to_fp4(
+                        packed_cpu.to(device=device)
+                    )
+                    gscale = gscale_cpu.to(device=device, dtype=torch.float32).reshape(
+                        1
+                    )
+                    scale_expanded = scale_cpu.to(
+                        device=device, dtype=torch.float32
+                    ).repeat_interleave(16, dim=1)
                     bf16_weights = fp4_values * scale_expanded * gscale
                     quantized = quantizer.fakequant_layer_bf16(bf16_weights)
                     tensors[weight_name] = quantized.to(device="cpu")
@@ -278,6 +329,7 @@ def _process_shards(
 
 def _group_layers_by_block(target_layers: list[str]) -> dict[int, list[str]]:
     from gptq.calibrate import layer_block_index
+
     layers_by_block: dict[int, list[str]] = {}
     for layer_name in target_layers:
         block_idx = layer_block_index(layer_name)
@@ -295,9 +347,12 @@ def _process_block_on_gpu(
     input_format: str,
     output_format: str,
     vanilla: bool,
+    codebook_dir: Path | None = None,
+    global_scales: dict[str, torch.Tensor] | None = None,
 ) -> None:
     device = torch.device(f"cuda:{gpu_id}")
     quantizer = CodebookQuantizer()
+    default_codebook = quantizer.codebook.clone()
 
     shard_to_layers: dict[str, list[str]] = {}
     for base in block_layers:
@@ -313,26 +368,54 @@ def _process_block_on_gpu(
         tensors = load_file(str(input_shard), device="cpu")
 
         for base in layers_in_shard:
+            if codebook_dir is not None:
+                _apply_layer_codebook(quantizer, codebook_dir, base, default_codebook)
             weight_name = _resolve_weight_name(base, weight_map)
 
             if input_format == "bf16":
                 bf16_cpu = tensors[weight_name]
+                gscale = (
+                    global_scales[base].to(device=device)
+                    if global_scales is not None and base in global_scales
+                    else None
+                )
                 if output_format == "bf16":
-                    print(f"  [GPU {gpu_id}] bf16→bf16 {base}")
-                    quantized = quantizer.fakequant_layer_bf16(bf16_cpu.to(device=device))
-                    tensors[weight_name] = quantized.to(device="cpu")
-                else:
-                    print(f"  [GPU {gpu_id}] bf16→nvfp4 {base}")
+                    tag = "bf16→bf16(gs)" if gscale is not None else "bf16→bf16"
+                    print(f"  [GPU {gpu_id}] {tag} {base}")
                     w = bf16_cpu.to(device=device, dtype=torch.float32)
+                    if gscale is not None:
+                        w = w / gscale
+                    out_features, in_features = w.shape
                     blocks = w.reshape(-1, 16)
                     opt_fp4, opt_scale = quantizer.fakequant_blocks_with_scale(blocks)
+                    dequantized = (opt_fp4 * opt_scale).reshape(
+                        out_features, in_features
+                    )
+                    if gscale is not None:
+                        dequantized = dequantized * gscale
+                    tensors[weight_name] = dequantized.to(
+                        dtype=bf16_cpu.dtype, device="cpu"
+                    )
+                else:
+                    tag = "bf16→nvfp4(gs)" if gscale is not None else "bf16→nvfp4"
+                    print(f"  [GPU {gpu_id}] {tag} {base}")
+                    w = bf16_cpu.to(device=device, dtype=torch.float32)
+                    if gscale is not None:
+                        w = w / gscale
                     out_features, in_features = w.shape
+                    blocks = w.reshape(-1, 16)
+                    opt_fp4, opt_scale = quantizer.fakequant_blocks_with_scale(blocks)
                     opt_fp4 = opt_fp4.reshape(out_features, in_features)
                     new_scale = opt_scale.reshape(out_features, in_features // 16)
-                    gscale = torch.tensor([1.0], dtype=torch.float32, device=device)
-                    new_weight_scale = quantizer._cast_scale_to_fp8(new_scale / gscale)
-                    tensors[weight_name] = quantizer.pack_fp4_to_uint8(opt_fp4).to(device="cpu")
-                    tensors[f"{base}.weight_scale"] = new_weight_scale.to(dtype=torch.float8_e4m3fn, device="cpu")
+                    if gscale is None:
+                        gscale = torch.tensor([1.0], dtype=torch.float32, device=device)
+                    new_weight_scale = quantizer._cast_scale_to_fp8(new_scale)
+                    tensors[weight_name] = quantizer.pack_fp4_to_uint8(opt_fp4).to(
+                        device="cpu"
+                    )
+                    tensors[f"{base}.weight_scale"] = new_weight_scale.to(
+                        dtype=torch.float8_e4m3fn, device="cpu"
+                    )
                     tensors[f"{base}.weight_scale_2"] = gscale.to(device="cpu")
             else:
                 scale_name = f"{base}.weight_scale"
@@ -340,16 +423,26 @@ def _process_block_on_gpu(
                 packed_cpu = tensors[weight_name]
                 scale_cpu = tensors.get(scale_name)
                 if scale_cpu is None:
-                    scale_cpu = _load_tensor_from_specific_shard(input_path, weight_map[scale_name], scale_name)
+                    scale_cpu = _load_tensor_from_specific_shard(
+                        input_path, weight_map[scale_name], scale_name
+                    )
                 gscale_cpu = tensors.get(gscale_name)
                 if gscale_cpu is None:
-                    gscale_cpu = _load_tensor_from_specific_shard(input_path, weight_map[gscale_name], gscale_name)
+                    gscale_cpu = _load_tensor_from_specific_shard(
+                        input_path, weight_map[gscale_name], gscale_name
+                    )
 
                 if output_format == "bf16":
                     print(f"  [GPU {gpu_id}] nvfp4→bf16 {base}")
-                    fp4_values = quantizer.unpack_uint8_to_fp4(packed_cpu.to(device=device))
-                    gscale = gscale_cpu.to(device=device, dtype=torch.float32).reshape(1)
-                    scale_expanded = scale_cpu.to(device=device, dtype=torch.float32).repeat_interleave(16, dim=1)
+                    fp4_values = quantizer.unpack_uint8_to_fp4(
+                        packed_cpu.to(device=device)
+                    )
+                    gscale = gscale_cpu.to(device=device, dtype=torch.float32).reshape(
+                        1
+                    )
+                    scale_expanded = scale_cpu.to(
+                        device=device, dtype=torch.float32
+                    ).repeat_interleave(16, dim=1)
                     bf16_weights = fp4_values * scale_expanded * gscale
                     quantized = quantizer.fakequant_layer_bf16(bf16_weights)
                     tensors[weight_name] = quantized.to(device="cpu")
@@ -360,11 +453,17 @@ def _process_block_on_gpu(
                     print(f"  [GPU {gpu_id}] {mode} {base}")
                     if vanilla:
                         quantized_packed = quantizer._fakequant_layer_vanilla(
-                            packed_cpu.to(device=device), scale_cpu.to(device=device), gscale_cpu.to(device=device))
+                            packed_cpu.to(device=device),
+                            scale_cpu.to(device=device),
+                            gscale_cpu.to(device=device),
+                        )
                         tensors[weight_name] = quantized_packed.to(device="cpu")
                     else:
                         quantized_packed, new_scale = quantizer.fakequant_layer(
-                            packed_cpu.to(device=device), scale_cpu.to(device=device), gscale_cpu.to(device=device))
+                            packed_cpu.to(device=device),
+                            scale_cpu.to(device=device),
+                            gscale_cpu.to(device=device),
+                        )
                         tensors[weight_name] = quantized_packed.to(device="cpu")
                         tensors[scale_name] = new_scale.to(device="cpu")
 
@@ -384,6 +483,8 @@ def _gpu_worker(
     input_format: str,
     output_format: str,
     vanilla: bool,
+    codebook_dir: Path | None = None,
+    global_scales: dict[str, torch.Tensor] | None = None,
 ) -> None:
     torch.cuda.set_device(gpu_id)
     for block_idx in block_indices:
@@ -396,12 +497,27 @@ def _gpu_worker(
             input_format=input_format,
             output_format=output_format,
             vanilla=vanilla,
+            codebook_dir=codebook_dir,
+            global_scales=global_scales,
         )
 
 
-def run(input_path: Path, output_path: Path, device: str, mlp_only: bool, dry_run: bool, vanilla: bool = False, output_format: str | None = None, num_gpus: int = 1) -> None:
+def run(
+    input_path: Path,
+    output_path: Path,
+    device: str,
+    mlp_only: bool,
+    dry_run: bool,
+    vanilla: bool = False,
+    output_format: str | None = None,
+    num_gpus: int = 1,
+    codebook_dir: Path | None = None,
+    global_scales_path: Path | None = None,
+) -> None:
     if not input_path.exists() or not input_path.is_dir():
-        raise FileNotFoundError(f"Input path does not exist or is not a directory: {input_path}")
+        raise FileNotFoundError(
+            f"Input path does not exist or is not a directory: {input_path}"
+        )
 
     weight_map = _load_index(input_path)
     input_format = detect_input_format(weight_map)
@@ -435,13 +551,20 @@ def run(input_path: Path, output_path: Path, device: str, mlp_only: bool, dry_ru
         )
         return
 
+    global_scales: dict[str, torch.Tensor] | None = None
+    if global_scales_path is not None:
+        global_scales = _load_global_scales(global_scales_path)
+        print(f"Loaded {len(global_scales)} global scales from {global_scales_path}")
+
     start_time = time.perf_counter()
     _copy_non_safetensors_files(input_path, output_path)
     output_path.mkdir(parents=True, exist_ok=True)
 
     layers_by_block = _group_layers_by_block(target_layers)
     sorted_blocks = sorted(layers_by_block.keys())
-    effective_gpus = min(num_gpus, len(sorted_blocks), max(1, torch.cuda.device_count()))
+    effective_gpus = min(
+        num_gpus, len(sorted_blocks), max(1, torch.cuda.device_count())
+    )
 
     print(f"\n{effective_gpus} GPU(s), {len(sorted_blocks)} blocks")
     gpu_assignments: list[list[int]] = [[] for _ in range(effective_gpus)]
@@ -450,7 +573,9 @@ def run(input_path: Path, output_path: Path, device: str, mlp_only: bool, dry_ru
 
     for gpu_id, blocks in enumerate(gpu_assignments):
         if blocks:
-            block_range = f"{blocks[0]}-{blocks[-1]}" if len(blocks) > 1 else str(blocks[0])
+            block_range = (
+                f"{blocks[0]}-{blocks[-1]}" if len(blocks) > 1 else str(blocks[0])
+            )
             print(f"  GPU {gpu_id}: blocks [{block_range}] ({len(blocks)} blocks)")
 
     ctx = mp.get_context("spawn")
@@ -470,6 +595,8 @@ def run(input_path: Path, output_path: Path, device: str, mlp_only: bool, dry_ru
                 input_format,
                 output_format,
                 vanilla,
+                codebook_dir,
+                global_scales,
             ),
         )
         processes.append(p)
@@ -478,7 +605,9 @@ def run(input_path: Path, output_path: Path, device: str, mlp_only: bool, dry_ru
     for p in processes:
         p.join()
         if p.exitcode != 0:
-            raise RuntimeError(f"GPU worker {p.name} failed with exit code {p.exitcode}")
+            raise RuntimeError(
+                f"GPU worker {p.name} failed with exit code {p.exitcode}"
+            )
 
     block_shard_files = set()
     for block_idx in sorted_blocks:
@@ -500,21 +629,51 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Apply codebook fake-quantization to quantized or BF16 layers."
     )
-    default_input = "/data/models/Qwen3-30B-A3B-NVFP4"
+    default_input = "/data/models/Qwen3-30B-A3B"
     default_output = default_input + "-CBINT2"
     parser.add_argument("--input-path", type=str, default=default_input)
     parser.add_argument("--output-path", type=str, default=default_output)
     parser.add_argument("--device", type=str, default=_default_device())
-    parser.add_argument("--mlp-only", action="store_true",
-                        help="Only quantize MLP layers (gate/up/down_proj + MoE experts), skip attention")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Print target layer names and shapes without quantizing")
-    parser.add_argument("--vanilla", action="store_true",
-                        help="Use vanilla codebook selection without scale optimization")
-    parser.add_argument("--output-format", type=str, default=None, choices=["nvfp4", "bf16"],
-                        help="Output format (default: auto-detect from GPU or CBINT2_COMPUTE_CAP env)")
-    parser.add_argument("--num-gpus", type=int, default=1,
-                        help="Number of GPUs for parallel block processing (default: 1)")
+    parser.add_argument(
+        "--mlp-only",
+        action="store_true",
+        help="Only quantize MLP layers (gate/up/down_proj + MoE experts), skip attention",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print target layer names and shapes without quantizing",
+    )
+    parser.add_argument(
+        "--vanilla",
+        action="store_true",
+        help="Use vanilla codebook selection without scale optimization",
+    )
+    parser.add_argument(
+        "--output-format",
+        type=str,
+        default=None,
+        choices=["nvfp4", "bf16"],
+        help="Output format (default: auto-detect from GPU or CBINT2_COMPUTE_CAP env)",
+    )
+    parser.add_argument(
+        "--num-gpus",
+        type=int,
+        default=1,
+        help="Number of GPUs for parallel block processing (default: 1)",
+    )
+    parser.add_argument(
+        "--codebook-dir",
+        type=str,
+        default=None,
+        help="Directory with per-layer .pt codebooks from codebook_analysis.py",
+    )
+    parser.add_argument(
+        "--global-scales",
+        type=str,
+        default=None,
+        help="Safetensors file with per-layer global scales (from extract_global_scales.py)",
+    )
     args = parser.parse_args()
 
     run(
@@ -526,6 +685,8 @@ def main() -> None:
         vanilla=args.vanilla,
         output_format=args.output_format,
         num_gpus=args.num_gpus,
+        codebook_dir=Path(args.codebook_dir) if args.codebook_dir else None,
+        global_scales_path=Path(args.global_scales) if args.global_scales else None,
     )
 
 

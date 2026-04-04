@@ -12,11 +12,13 @@ from safetensors.torch import load_file, save_file
 
 from fakequant import CodebookQuantizer
 from fakequant_model import (
+    _apply_layer_codebook,
     _copy_non_safetensors_files,
     _default_device,
     _filter_layers,
     _find_bf16_layers,
     _find_quantized_layers,
+    _load_global_scales,
     _load_index,
     _load_tensor_from_specific_shard,
     _resolve_gscale_name,
@@ -79,9 +81,12 @@ def _process_block_on_gpu(
     calibration_dir: Path,
     input_format: str,
     output_format: str,
+    codebook_dir: Path | None = None,
+    global_scales: dict[str, torch.Tensor] | None = None,
 ) -> None:
     device = torch.device(f"cuda:{gpu_id}")
     quantizer = CodebookQuantizer()
+    default_codebook = quantizer.codebook.clone()
 
     shard_to_layers: dict[str, list[str]] = {}
     for base in block_layers:
@@ -97,14 +102,22 @@ def _process_block_on_gpu(
         tensors = load_file(str(input_shard), device="cpu")
 
         for base in layers_in_shard:
+            if codebook_dir is not None:
+                _apply_layer_codebook(quantizer, codebook_dir, base, default_codebook)
+
             weight_name = _resolve_weight_name(base, weight_map)
             scale_name = f"{base}.weight_scale"
             gscale_name = _resolve_gscale_name(base, weight_map)
 
+            layer_gscale = None
             gscale_for_output = torch.tensor([1.0], device=device)
             if input_format == "bf16":
                 w = tensors[weight_name].to(device=device, dtype=torch.float32)
                 _, in_features = w.shape
+                if global_scales is not None and base in global_scales:
+                    layer_gscale = global_scales[base].to(device=device)
+                    w = w / layer_gscale
+                    gscale_for_output = layer_gscale
                 ref_mode = "bf16"
             else:
                 packed_cpu = tensors[weight_name]
@@ -138,25 +151,36 @@ def _process_block_on_gpu(
             gptq.H = hessian.to(device)
             gptq.num_samples = 1
 
-            print(f"  [GPU {gpu_id}] gptq({ref_mode})→{output_format} {base}")
+            gs_tag = "(gs)" if layer_gscale is not None else ""
+            print(f"  [GPU {gpu_id}] gptq({ref_mode}{gs_tag})→{output_format} {base}")
 
             fp4_out, scales_out, _, _ = gptq.quantize(w)
 
             if output_format == "bf16":
-                dequantized = (fp4_out * scales_out).to(dtype=torch.bfloat16)
-                tensors[weight_name] = dequantized.to(device="cpu")
+                dequantized = fp4_out * scales_out.repeat_interleave(16, dim=1)
+                if layer_gscale is not None:
+                    dequantized = dequantized * layer_gscale
+                tensors[weight_name] = dequantized.to(
+                    dtype=torch.bfloat16, device="cpu"
+                )
                 for drop_key in [scale_name, gscale_name]:
                     tensors.pop(drop_key, None)
             else:
-                gscale_val = gscale_for_output
                 new_packed = quantizer.pack_fp4_to_uint8(fp4_out)
-                new_weight_scale = quantizer._cast_scale_to_fp8(scales_out / gscale_val)
+                if layer_gscale is not None:
+                    new_weight_scale = quantizer._cast_scale_to_fp8(scales_out)
+                else:
+                    new_weight_scale = quantizer._cast_scale_to_fp8(
+                        scales_out / gscale_for_output
+                    )
                 tensors[weight_name] = new_packed.to(device="cpu")
                 tensors[scale_name] = new_weight_scale.to(
                     dtype=torch.float8_e4m3fn, device="cpu"
                 )
                 if input_format == "bf16":
-                    tensors[f"{base}.weight_scale_2"] = gscale_val.to(device="cpu")
+                    tensors[f"{base}.weight_scale_2"] = gscale_for_output.to(
+                        device="cpu"
+                    )
 
             del gptq, w, hessian
             torch.cuda.empty_cache()
@@ -175,6 +199,8 @@ def _gpu_worker(
     calibration_dir: Path,
     input_format: str,
     output_format: str,
+    codebook_dir: Path | None = None,
+    global_scales: dict[str, torch.Tensor] | None = None,
 ) -> None:
     torch.cuda.set_device(gpu_id)
     for block_idx in block_indices:
@@ -189,6 +215,8 @@ def _gpu_worker(
             calibration_dir=calibration_dir,
             input_format=input_format,
             output_format=output_format,
+            codebook_dir=codebook_dir,
+            global_scales=global_scales,
         )
 
 
@@ -341,6 +369,8 @@ def run(
     hessian_dir: str = "/data/hessians",
     output_format: str | None = None,
     num_gpus: int = 1,
+    codebook_dir: Path | None = None,
+    global_scales_path: Path | None = None,
 ) -> None:
     if not input_path.exists() or not input_path.is_dir():
         raise FileNotFoundError(
@@ -363,6 +393,11 @@ def run(
     print(f"Selected for processing: {len(target_layers)}")
     if mlp_only:
         print(f"Skipped (non-MLP): {len(all_layers) - len(target_layers)}")
+
+    global_scales: dict[str, torch.Tensor] | None = None
+    if global_scales_path is not None:
+        global_scales = _load_global_scales(global_scales_path)
+        print(f"Loaded {len(global_scales)} global scales from {global_scales_path}")
 
     hessian_path = Path(hessian_dir)
     if not hessian_path.exists() or not hessian_path.is_dir():
@@ -427,6 +462,8 @@ def run(
                 hessian_path,
                 input_format,
                 output_format,
+                codebook_dir,
+                global_scales,
             ),
         )
         processes.append(p)
@@ -459,7 +496,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Apply GPTQ-optimized codebook quantization to NVFP4 or BF16 layers."
     )
-    default_input = "/data/models/Qwen3-30B-A3B-NVFP4"
+    default_input = "/data/models/Qwen3-30B-A3B"
     default_output = default_input + "-CBINT2-GPTQ"
     parser.add_argument("--input-path", type=str, default=default_input)
     parser.add_argument("--output-path", type=str, default=default_output)
@@ -485,6 +522,18 @@ def main() -> None:
         default=1,
         help="Number of GPUs for parallel block processing (default: 1)",
     )
+    parser.add_argument(
+        "--codebook-dir",
+        type=str,
+        default=None,
+        help="Directory with per-layer .pt codebooks from codebook_analysis.py",
+    )
+    parser.add_argument(
+        "--global-scales",
+        type=str,
+        default=None,
+        help="Safetensors file with per-layer global scales (from extract_global_scales.py)",
+    )
     args = parser.parse_args()
 
     run(
@@ -496,6 +545,8 @@ def main() -> None:
         hessian_dir=args.hessian_dir,
         output_format=args.output_format,
         num_gpus=args.num_gpus,
+        codebook_dir=Path(args.codebook_dir) if args.codebook_dir else None,
+        global_scales_path=Path(args.global_scales) if args.global_scales else None,
     )
 
 
